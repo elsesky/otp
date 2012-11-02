@@ -1607,6 +1607,9 @@ static Boolean decode_params(db_state *state, byte *buffer, int *index, param_ar
 
     switch (param->type.c) {
     case SQL_C_CHAR:
+	    if (size > param->type.col_size) {
+		    return FALSE;
+	    }
 	    if (binary_strings(state)) {
 		    ei_decode_binary(buffer, index,
 				     &(param->values.string[param->offset]), &bin_size);
@@ -1620,6 +1623,9 @@ static Boolean decode_params(db_state *state, byte *buffer, int *index, param_ar
 	    }
 	    break;
     case SQL_C_WCHAR:
+	    if (size > param->type.col_size) {
+		    return FALSE;
+	    }
 	    ei_decode_binary(buffer, index, &(param->values.string[param->offset]), &bin_size);
 	    param->offset += param->type.len;
 	    break;
