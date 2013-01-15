@@ -525,7 +525,7 @@ static db_result_msg db_connect(byte *args, db_state *state)
 	diagnos = get_diagnos(SQL_HANDLE_DBC, connection_handle(state));
 	strcat((char *)diagnos.error_msg, " Set autocommit mode failed.");
 
-	msg = encode_error_message(diagnos.error_msg, extended_error(state, diagnos.sqlState), diagnos.nativeError);
+	msg = encode_error_message(diagnos.error_msg);
 
 	if(!sql_success(SQLFreeHandle(SQL_HANDLE_DBC,
 				      connection_handle(state))))
