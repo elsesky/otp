@@ -218,6 +218,8 @@ static SQLLEN* alloc_strlen_indptr(int n, int val);
 
 static void init_driver(int erl_auto_commit_mode, int erl_trace_driver,
 			   db_state *state);
+static void init_driver_oracleworkaround(int erl_auto_commit_mode,
+                           db_state *state);
 static void init_param_column(param_array *params, byte *buffer, int *index,
 			      int num_param_values, db_state* state);
 
@@ -487,6 +489,8 @@ static db_result_msg db_connect(byte *args, db_state *state)
     
 	return msg;
     }
+
+    init_driver_oracleworkaround(erl_auto_commit_mode, state);
 
     msg = retrive_scrollable_cursor_support_info(state);
   
@@ -2088,6 +2092,23 @@ static void init_driver(int erl_auto_commit_mode, int erl_trace_driver,
 				      SQL_ATTR_TRACE,
 				      (SQLPOINTER)trace_driver, 0)))
 	    DO_EXIT(EXIT_CONNECTION);
+}
+
+static void init_driver_oracleworkaround(int erl_auto_commit_mode,
+                        db_state *state)
+{
+    SQLLEN auto_commit_mode;
+
+    if(erl_auto_commit_mode == ON) {
+        auto_commit_mode = SQL_AUTOCOMMIT_ON;
+    } else {
+        auto_commit_mode = SQL_AUTOCOMMIT_OFF;
+    }
+
+    if(!sql_success(SQLSetConnectAttr(connection_handle(state),
+                                      SQL_ATTR_AUTOCOMMIT,
+                                      (SQLPOINTER)auto_commit_mode, 0)))
+        DO_EXIT(EXIT_CONNECTION);
 }
 
 static void init_param_column(param_array *params, byte *buffer, int *index,
