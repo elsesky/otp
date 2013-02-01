@@ -22,16 +22,26 @@
 
 -export([all/0, suite/0,groups/0,init_per_suite/1, end_per_suite/1, 
 	 init_per_group/2,end_per_group/2, t_start/1, t_start_link/1,
+	 absolute_erl/1,
+	 additional_masters/1,
+	 start_master/1,
+	 start_with_additional_master/1,
 	 start_link_nodedown/1, errors/1]).
 
 %% Internal exports.
 -export([fun_init/1, test_errors/1]).
 -export([timeout_test/1, auth_test/1, rsh_test/1, start_a_slave/3]).
 
-suite() -> [{ct_hooks,[ts_install_cth]}].
+%suite() -> [{ct_hooks,[ts_install_cth]}].
+suite() -> [].
 
 all() -> 
-    [t_start_link, start_link_nodedown, t_start, errors].
+    [t_start_link, start_link_nodedown, t_start, errors,
+	absolute_erl,
+	additional_masters,
+	start_master,
+	start_with_additional_master
+    ].
 
 groups() -> 
     [].
@@ -95,6 +105,117 @@ t_start_link(Config) when is_list(Config) ->
     ?line is_dead(Slave2),
 		  
     ?line test_server:timetrap_cancel(Dog),
+    ok.
+
+%% Option: absolute path to "erl" command.
+absolute_erl(suite) -> [];
+absolute_erl(Config) when is_list(Config) ->
+    Dog = test_server:timetrap(test_server:seconds(20)),
+
+    Host = host(),
+    Slave1 = node_name(Host, slave1),
+
+    {ok,[[Root]]} = init:get_argument( root ),
+    {ok,[[Prog]]} = init:get_argument( progname ),
+    %% Regexp Prog does not restrict F to only files with basename Prog. Why?
+    [Erl | _T] = filelib:fold_files( Root, Prog, true, fun (F,A) -> case filename:basename(F) of Prog -> [F|A]; _Else -> A end end, [] ),
+    Slave1 = node_name(Host, slave1),
+    {ok, Slave1} = slave:start(Host, [{name, slave1}, {prog, Erl}]),
+    wait_alive(Slave1),
+
+    rpc:call(Slave1, erlang, halt, []),
+    test_server:sleep(250),
+    is_dead(Slave1),
+
+    test_server:timetrap_cancel(Dog),
+    ok.
+
+%% API: add another master to a running slave.
+additional_masters(suite) -> [];
+additional_masters(Config) when is_list(Config) ->
+    Dog = test_server:timetrap(test_server:seconds(20)),
+
+    Host = host(),
+    Slave1 = node_name(Host, slave1),
+    Name = another_master,
+    Master = node_name(Host, Name),
+
+    {ok, Master} = slave:start_master( Host, [{name, Name}] ),
+    wait_alive(Master),
+    {ok, Slave_pid} = rpc:call(Master, slave, start, [Host, [{name, slave1}, {return, pid}]]),
+    Slave1 = erlang:node(Slave_pid),
+    wait_alive(Slave1),
+    {ok, Masters} = slave:additional_masters( Slave_pid, [erlang:node()] ),
+    2 = erlang:length(Masters),
+    [] = Masters -- [erlang:node(), Master],
+
+    rpc:call(Master, erlang, halt, []),
+    test_server:sleep(250),
+    is_dead(Master),
+    test_server:sleep(250),
+    is_alive(Slave1),
+
+    rpc:call(Slave1, erlang, halt, []),
+    test_server:sleep(250),
+    is_dead(Slave1),
+
+    test_server:timetrap_cancel(Dog),
+    ok.
+
+%% Option: start a slave with options in list.
+start_master(suite) -> [];
+start_master(Config) when is_list(Config) ->
+    Dog = test_server:timetrap(test_server:seconds(20)),
+
+    Host = host(),
+    Slave1 = node_name(Host, slave1),
+    Name = another_master,
+    Master = node_name(Host, Name),
+
+    {ok, Slave1} = slave:start(Host, [{name, slave1}]),
+    wait_alive(Slave1),
+    {ok, Master} = rpc:call(Slave1, slave, start_master, [Host, [{name, Name}]]),
+    wait_alive(Master),
+
+    rpc:call(Slave1, erlang, halt, []),
+    test_server:sleep(250),
+    is_dead(Slave1),
+    test_server:sleep(250),
+    is_alive(Master),
+
+    rpc:call(Master, erlang, halt, []),
+    test_server:sleep(250),
+    is_dead(Master),
+
+    test_server:timetrap_cancel(Dog),
+    ok.
+
+%% Option: start a slave with an additional master.
+start_with_additional_master(suite) -> [];
+start_with_additional_master(Config) when is_list(Config) ->
+    Dog = test_server:timetrap(test_server:seconds(20)),
+
+    Host = host(),
+    Slave1 = node_name(Host, slave1),
+    Name = another_master,
+    Master = node_name(Host, Name),
+
+    {ok, Master} = slave:start_master( Host, [{name, Name}] ),
+    wait_alive(Master),
+    {ok, Slave1} = rpc:call(Master, slave, start, [Host, [{name, slave1}, {additional_masters, [erlang:node()]}]]),
+    wait_alive(Slave1),
+
+    rpc:call(Master, erlang, halt, []),
+    test_server:sleep(250),
+    is_dead(Master),
+    test_server:sleep(250),
+    is_alive(Slave1),
+
+    rpc:call(Slave1, erlang, halt, []),
+    test_server:sleep(250),
+    is_dead(Slave1),
+
+    test_server:timetrap_cancel(Dog),
     ok.
 
 %% Test that slave:start_link() works when the master exits.
