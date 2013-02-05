@@ -38,7 +38,7 @@
 	 relay/1]).
 
 %% Internal exports 
--export([slave_start/1]).
+-export([wait_for_slave/7, slave_start/1, slave_start_new/1, wait_for_master_to_die/2]).
 
 -import(error_logger, [error_msg/2]).
 
@@ -175,13 +175,14 @@ start( Host0, Options ) when is_list(Options) ->
 	tty=tty_to_master( Options ),
 	name=Name,
 	die=die_with_master( Options ),
+	%% No duplicated masters.
 	additional_masters=
-		[to_list(X) || X <- proplists:get_value( additional_masters, Options, [] )],
+		lists:usort( [to_list(X) || X <- proplists:get_value(additional_masters, Options, [])] ),
 	args=args( Options )
     },
     Return = proplists:get_value( return, Options, node ),
     start_return( Return,
-	start_it(net_adm:ping(Remote_node), Remote_node, LinkTo, Host, Rsh, Start_args) ).
+	start_new(net_adm:ping(Remote_node), Remote_node, LinkTo, Host, Rsh, Start_args) ).
 
 -spec start(Host, Name, Args) -> {ok, Node} | {error, Reason} when
       Host :: atom(),
@@ -216,9 +217,23 @@ start_link(Host, Name) -> start(Host, [link, {name, Name}]).
 
 start_link(Host, Name, Args) -> start(Host, [link, {name, Name}, {args, Args}]).
 
-
-start(Host, Name, Args, LinkTo, Prog) ->
-    start(Host, [{name, Name}, {args, Args}, {link, LinkTo}, {prog, Prog}]).
+%% This undocumented function is used by the test server for a few tests.
+%% These tests are only possible to run on Erlang OTP Team computers.
+%% If you can not test it, you can not change it. Do not touch.
+start(Host0, Name, Args, LinkTo, Prog) ->
+    Host =
+	case net_kernel:longnames() of
+	    true -> dns(Host0);
+	    false -> strip_host_name(to_list(Host0));
+	    ignored -> exit(not_alive)
+	end,
+    Node = list_to_atom(lists:concat([Name, "@", Host])),
+    case net_adm:ping(Node) of
+	pang ->
+	    start_it(Host, Name, Node, Args, LinkTo, Prog);
+	pong ->
+	    {error, {already_running, Node}}
+    end.
 
 
 -spec start_master(Host, Options) -> {ok, Node} | {error, Reason} when
@@ -235,7 +250,8 @@ start_master(Host, Options) ->
       Current_masters :: [node()],
       Reason :: timeout.
 additional_masters( Slave_pid, Masters ) when is_pid(Slave_pid)->
-    Slave_pid ! {additional_masters, erlang:self(), Masters},
+    %% No duplicated masters.
+    Slave_pid ! {additional_masters, erlang:self(), lists:usort(Masters)},
     receive
 	{additional_masters_ok, Slave_pid, Current_masters} -> {ok, Current_masters}
 	after 32000 -> {error, timeout}
@@ -324,11 +340,154 @@ tty_to_master(false, _Node) -> "".
 
 %% Starts a new slave node.
 
-start_it(pong, Remote_node, _LinkTo, _Host, _Rsh, _Start_args) ->
+start_it(Host, Name, Node, Args, LinkTo, Prog) ->
+    spawn(?MODULE, wait_for_slave, [self(), Host, Name, Node, Args, LinkTo,
+				    Prog]),
+    receive
+	{result, Result} -> Result
+    end.
+
+%% Waits for the slave to start.
+
+wait_for_slave(Parent, Host, Name, Node, Args, LinkTo, Prog) ->
+    Waiter = register_unique_name(0),
+    case mk_cmd(Host, Name, Args, Waiter, Prog) of
+	{ok, Cmd} ->
+%%	    io:format("Command: ~s~n", [Cmd]),
+	    open_port({spawn, Cmd}, [stream]),
+	    receive
+		{SlavePid, slave_started} ->
+		    unregister(Waiter),
+		    slave_started(Parent, LinkTo, SlavePid)
+	    after 32000 ->
+		    %% If it seems that the node was partially started,
+		    %% try to kill it.
+		    Node = list_to_atom(lists:concat([Name, "@", Host])),
+		    case net_adm:ping(Node) of
+			pong ->
+			    spawn(Node, erlang, halt, []),
+			    ok;
+			_ ->
+			    ok
+		    end,
+		    Parent ! {result, {error, timeout}}
+	    end;
+	Other ->
+	    Parent ! {result, Other}
+    end.
+
+slave_started(ReplyTo, no_link, Slave) when is_pid(Slave) ->
+    ReplyTo ! {result, {ok, node(Slave)}};
+slave_started(ReplyTo, Master, Slave) when is_pid(Master), is_pid(Slave) ->
+    process_flag(trap_exit, true),
+    link(Master),
+    link(Slave),
+    ReplyTo ! {result, {ok, node(Slave)}},
+    one_way_link(Master, Slave).
+
+%% This function simulates a one-way link, so that the slave node
+%% will be killed if the master process terminates, but the master
+%% process will not be killed if the slave node terminates.
+
+one_way_link(Master, Slave) ->
+    receive
+	{'EXIT', Master, _Reason} ->
+	    unlink(Slave),
+	    Slave ! {nodedown, node()};
+	{'EXIT', Slave, _Reason} ->
+	    unlink(Master);
+	_Other ->
+	    one_way_link(Master, Slave)
+    end.
+
+register_unique_name(Number) ->
+    Name = list_to_atom(lists:concat(["slave_waiter_", Number])),
+    case catch register(Name, self()) of
+	true ->
+	    Name;
+	{'EXIT', {badarg, _}} ->
+	    register_unique_name(Number+1)
+    end.
+
+%% Makes up the command to start the nodes.
+%% If the node should run on the local host, there is
+%% no need to use rsh.
+
+mk_cmd(Host, Name, Args, Waiter, Prog) ->
+    BasicCmd = lists:concat([Prog,
+			     " -detached -noinput -master ", node(),
+			     " ", long_or_short(), Name, "@", Host,
+			     " -s slave slave_start ", node(),
+			     " ", Waiter,
+			     " ", Args]),
+
+    case after_char($@, atom_to_list(node())) of
+	Host ->
+	    {ok, BasicCmd};
+	_ ->
+	    case rsh() of
+		{ok, Rsh} ->
+		    {ok, lists:concat([Rsh, " ", Host, " ", BasicCmd])};
+		Other ->
+		    Other
+	    end
+    end.
+
+%% Give the user an opportunity to run another program,
+%% than the "rsh".  On HP-UX rsh is called remsh; thus HP users
+%% must start erlang as erl -rsh remsh.
+%%
+%% Also checks that the given program exists.
+%%
+%% Returns: {ok, RshPath} | {error, Reason}
+
+rsh() ->
+    Rsh =
+	case init:get_argument(rsh) of
+	    {ok, [[Prog]]} -> Prog;
+	    _ -> "rsh"
+	end,
+    case os:find_executable(Rsh) of
+	false -> {error, no_rsh};
+	Path -> {ok, Path}
+    end.
+
+long_or_short() ->
+    case net_kernel:longnames() of
+	true -> " -name ";
+	false -> " -sname "
+    end.
+
+%% This function will be invoked on the slave, using the -s option of erl.
+%% It will wait for the master node to terminate.
+
+slave_start([Master, Waiter]) ->
+    ?dbg({?MODULE, slave_start}, [[Master, Waiter]]),
+    spawn(?MODULE, wait_for_master_to_die, [Master, Waiter]).
+
+wait_for_master_to_die(Master, Waiter) ->
+    ?dbg({?MODULE, wait_for_master_to_die}, [Master, Waiter]),
+    process_flag(trap_exit, true),
+    monitor_node(Master, true),
+    {Waiter, Master} ! {self(), slave_started},
+    wloop(Master).
+
+wloop(Master) ->
+    receive
+	{nodedown, Master} ->
+	    ?dbg({?MODULE, wloop},
+		 [[Master], {received, {nodedown, Master}}, halting_node] ),
+	    halt();
+	_Other ->
+	    wloop(Master)
+    end.
+
+%% New code
+start_new(pong, Remote_node, _LinkTo, _Host, _Rsh, _Start_args) ->
     {error, {already_running, Remote_node}};
-start_it(pang, Remote_node, LinkTo, Host, Rsh, Start_args) ->
+start_new(pang, Remote_node, LinkTo, Host, Rsh, Start_args) ->
     Self = erlang:self(),
-    erlang:spawn(fun() -> wait_for_slave(Self, Remote_node, LinkTo, Host, Rsh, Start_args) end),
+    erlang:spawn(fun() -> wait_for_slave_new(Self, Remote_node, LinkTo, Host, Rsh, Start_args) end),
     receive
 	{result, Result} -> Result
     end.
@@ -340,16 +499,16 @@ start_return( _Return, Error ) -> Error.
 
 %% Waits for the slave to start.
 
-wait_for_slave(Parent, Remote_node, LinkTo, Host, Rsh, Start_args) ->
-    Waiter = register_unique_name(0),
-    case mk_cmd(Host, Rsh, Start_args, to_list(Waiter)) of
+wait_for_slave_new(Parent, Remote_node, LinkTo, Host, Rsh, Start_args) ->
+    Waiter = register_unique_name_new(0),
+    case mk_cmd_new(Host, Rsh, Start_args, to_list(Waiter)) of
 	{ok, Cmd} ->
 	    Port = erlang:open_port({spawn, Cmd}, [stream]),
 	    receive
 		{SlavePid, slave_started} ->
-		    unregister(Waiter),
+		    erlang:unregister(Waiter),
 		    wait_for_slave_close_port(Port, erlang:port_info(Port,id)),
-		    slave_started(Parent, LinkTo, SlavePid)
+		    slave_started_new(Parent, LinkTo, SlavePid)
 	    after 32000 ->
 		    %% If it seems that the node was partially started,
 		    %% try to kill it.
@@ -371,20 +530,20 @@ wait_for_slave_close_port( _Port, undefined ) -> ok;
 wait_for_slave_close_port( Port, _Info ) -> erlang:port_close(Port).
 
 
-slave_started(ReplyTo, no_link, Slave) when is_pid(Slave) ->
+slave_started_new(ReplyTo, no_link, Slave) when is_pid(Slave) ->
     ReplyTo ! {result, {ok, Slave}};
-slave_started(ReplyTo, Master, Slave) when is_pid(Master), is_pid(Slave) ->
+slave_started_new(ReplyTo, Master, Slave) when is_pid(Master), is_pid(Slave) ->
     process_flag(trap_exit, true),
     link(Master),
     link(Slave),
     ReplyTo ! {result, {ok, Slave}},
-    one_way_link(Master, Slave).
+    one_way_link_new(Master, Slave).
 
 %% This function simulates a one-way link, so that the slave node
 %% will be killed if the master process terminates, but the master
 %% process will not be killed if the slave node terminates.
 
-one_way_link(Master, Slave) ->
+one_way_link_new(Master, Slave) ->
     receive
 	{'EXIT', Master, _Reason} ->
 	    unlink(Slave),
@@ -392,10 +551,10 @@ one_way_link(Master, Slave) ->
 	{'EXIT', Slave, _Reason} ->
 	    unlink(Master);
 	_Other ->
-	    one_way_link(Master, Slave)
+	    one_way_link_new(Master, Slave)
     end.
 
-register_unique_name(Number) ->
+register_unique_name_new(Number) ->
     Name = list_to_atom(lists:concat(["slave_waiter_", Number])),
     case catch register(Name, self()) of
 	true ->
@@ -409,7 +568,7 @@ register_unique_name(Number) ->
 %% If the node should run on the local host, there is
 %% no need to use rsh.
 
-mk_cmd(Host, Rsh0, Args, Waiter) ->
+mk_cmd_new(Host, Rsh0, Args, Waiter) ->
     Node = to_list(erlang:node()),
     BasicCmd = string:join([Args#start_args.prog,
 			"-detached",
@@ -453,35 +612,36 @@ long_or_short(Name) ->
 %% This function will be invoked on the slave, using the -s option of erl.
 %% It will wait for the master node to terminate.
 
-slave_start([Die, Waiter | Masters]=_Args) ->
-    ?dbg({?MODULE, slave_start}, [_Args]),
-    erlang:spawn(fun() -> wait_for_master_to_die(Die, Waiter, Masters) end).
+slave_start_new([Die, Waiter | Masters]=_Args) ->
+    ?dbg({?MODULE, slave_start_new}, [_Args]),
+    erlang:spawn(fun() -> wait_for_master_to_die_new(Die, Waiter, Masters) end).
 
-wait_for_master_to_die(Die, Waiter, Masters) ->
-    ?dbg({?MODULE, wait_for_master_to_die}, [Die, Waiter, Masters]),
+wait_for_master_to_die_new(Die, Waiter, Masters) ->
+    ?dbg({?MODULE, wait_for_master_to_die_new}, [Die, Waiter, Masters]),
     erlang:process_flag(trap_exit, true),
     [erlang:monitor_node(X, true) || X <- Masters],
     [Master | _T] = Masters,
     {Waiter, Master} ! {erlang:self(), slave_started},
-    wloop(Die, erlang:node(), Masters, previous_nodedown).
+    wloop_new(Die, erlang:node(), Masters, previous_nodedown).
 
-wloop(?DIE, _My_node, [], _Nodedown) ->
+wloop_new(?DIE, _My_node, [], _Nodedown) ->
 	?dbg({?MODULE, wloop}, [[_My_node], {received, {nodedown, _Nodedown}}, halting_node] ),
 	erlang:halt();
-wloop(?DIE=Die, My_node, Masters, Nodedown) ->
+wloop_new(?DIE=Die, My_node, Masters, Nodedown) ->
     receive
 	{nodedown, Master} ->
 	    Remaining = lists:delete( Master, Masters ),
 	    ?dbg({?MODULE, wloop}, [[My_node], {received, {nodedown, Master}}, {remaining, Remaining}] ),
-	    wloop(Die, My_node, Remaining, Master);
+	    wloop_new(Die, My_node, Remaining, Master);
 	{additional_masters, From, Additional_masters} ->
-	    New_masters = Masters ++ Additional_masters,
+	    %% No duplicates.
+	    New_masters = (Masters -- Additional_masters) ++ Additional_masters,
 	    From ! {additional_masters_ok, erlang:self(), New_masters},
-	    wloop(Die, My_node, New_masters, Nodedown);
+	    wloop_new(Die, My_node, New_masters, Nodedown);
 	_Other ->
-	    wloop(Die, My_node, Masters, Nodedown)
+	    wloop_new(Die, My_node, Masters, Nodedown)
     end;
-wloop(?DONT_DIE, _My_node, _Masters, _Nodedown) -> ok.
+wloop_new(?DONT_DIE, _My_node, _Masters, _Nodedown) -> ok.
 
 %% Just the short hostname, not the qualified, for convenience.
 

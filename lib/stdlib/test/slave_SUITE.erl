@@ -116,9 +116,10 @@ absolute_erl(Config) when is_list(Config) ->
     Slave1 = node_name(Host, slave1),
 
     {ok,[[Root]]} = init:get_argument( root ),
+    Bin = filename:join( [Root, "bin"] ),
     {ok,[[Prog]]} = init:get_argument( progname ),
     %% Regexp Prog does not restrict F to only files with basename Prog. Why?
-    [Erl | _T] = filelib:fold_files( Root, Prog, true, fun (F,A) -> case filename:basename(F) of Prog -> [F|A]; _Else -> A end end, [] ),
+    [Erl | _T] = filelib:fold_files( Bin, Prog, true, fun (F,A) -> case filename:basename(F) of Prog -> [F|A]; _Else -> A end end, [] ),
     Slave1 = node_name(Host, slave1),
     {ok, Slave1} = slave:start(Host, [{name, slave1}, {prog, Erl}]),
     wait_alive(Slave1),
