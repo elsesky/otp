@@ -83,9 +83,6 @@ extern int erts_printf_double(fmtfn_t, void *, char, int, int, double);
 
 extern int (*erts_printf_eterm_func)(fmtfn_t, void*, ErlPfEterm, long, ErlPfEterm*);
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif
 
